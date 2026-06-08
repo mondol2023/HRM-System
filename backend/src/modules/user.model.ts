@@ -41,8 +41,8 @@ UserSchema.methods.comparePassword = async function (
 
 // Never expose password in JSON output
 UserSchema.set("toJSON", {
-  transform: (_doc, ret) => {
-    delete ret.password;
+  transform: (_doc, ret: Record<string, unknown>) => {
+    ret["password"] = undefined;
     return ret;
   },
 });

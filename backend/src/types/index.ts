@@ -39,6 +39,7 @@ export type Department =
   | "legal";
 
 export interface IPerformanceNote {
+  _id: Types.ObjectId; // subdocument _id (Mongoose adds by default)
   note: string;
   addedBy: Types.ObjectId;
   sentiment?: "positive" | "neutral" | "negative";

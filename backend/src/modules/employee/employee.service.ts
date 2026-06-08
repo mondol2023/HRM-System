@@ -1,7 +1,7 @@
 // src/modules/employee/employee.service.ts
 import mongoose from "mongoose";
 import { Employee } from "./employee.model";
-import { cacheGet, cacheSet, cacheInvalidatePattern } from "../../config/redis";
+import { cacheGet, cacheSet, cacheDel, cacheInvalidatePattern } from "../../config/redis";
 import { IEmployee, IPaginatedResponse, IPaginationQuery, AppError } from "../../types";
 import { aiQueue } from "../ai/ai.queue";
 
@@ -89,7 +89,7 @@ export class EmployeeService {
 
     await Promise.all([
       cacheInvalidatePattern(`${CACHE_PREFIX}:list:*`),
-      cacheInvalidatePattern(`${CACHE_PREFIX}:${id}`),
+      cacheDel(`${CACHE_PREFIX}:${id}`),
     ]);
 
     return emp;
@@ -135,7 +135,7 @@ export class EmployeeService {
     // Also queue attrition risk refresh
     await aiQueue.add("attrition", { employeeId });
 
-    await cacheInvalidatePattern(`${CACHE_PREFIX}:${employeeId}`);
+    await cacheDel(`${CACHE_PREFIX}:${employeeId}`);
     return emp;
   }
 

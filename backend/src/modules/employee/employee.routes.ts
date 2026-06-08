@@ -3,6 +3,7 @@ import { Router } from "express";
 import { employeeController } from "./employee.controller";
 import { authenticate, authorize } from "../../middleware/auth.middleware";
 import { validate } from "../../middleware/validate.middleware";
+import { apiLimiter } from "../../middleware/rateLimit.middleware";
 import {
   createEmployeeSchema,
   updateEmployeeSchema,
@@ -12,7 +13,7 @@ import {
 
 const router = Router();
 
-router.use(authenticate);
+router.use(authenticate, apiLimiter);
 
 router.get("/stats", authorize("admin", "hr"), employeeController.stats.bind(employeeController));
 router.get("/", authorize("admin", "hr", "manager"), validate(listQuerySchema, "query"), employeeController.list.bind(employeeController));

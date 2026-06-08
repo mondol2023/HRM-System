@@ -1,5 +1,5 @@
 // src/modules/ai/ai.queue.ts
-import Bull, { Queue, Job } from "bull";
+import Bull, { type Queue, Job } from "bull";
 import { Employee } from "../employee/employee.model";
 import { aiService } from "./ai.service";
 import { logger } from "../../config/logger";
