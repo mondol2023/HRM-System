@@ -17,6 +17,7 @@ router.use(authenticate, apiLimiter);
 
 router.get("/stats", authorize("admin", "hr"), employeeController.stats.bind(employeeController));
 router.get("/", authorize("admin", "hr", "manager"), validate(listQuerySchema, "query"), employeeController.list.bind(employeeController));
+// Any authenticated role may call this; per-record access (self/manager/admin/hr) is enforced in EmployeeService.getById
 router.get("/:id", employeeController.getOne.bind(employeeController));
 router.post("/", authorize("admin", "hr"), validate(createEmployeeSchema), employeeController.create.bind(employeeController));
 router.patch("/:id", authorize("admin", "hr"), validate(updateEmployeeSchema), employeeController.update.bind(employeeController));

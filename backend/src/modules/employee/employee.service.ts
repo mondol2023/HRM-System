@@ -2,7 +2,7 @@
 import mongoose from "mongoose";
 import { Employee } from "./employee.model";
 import { cacheGet, cacheSet, cacheDel, cacheInvalidatePattern } from "../../config/redis";
-import { IEmployee, IPaginatedResponse, IPaginationQuery, AppError } from "../../types";
+import { IEmployee, IPaginatedResponse, IPaginationQuery, ITokenPayload, AppError } from "../../types";
 import { aiQueue } from "../ai/ai.queue";
 
 const CACHE_TTL = 300; // 5 minutes
@@ -59,20 +59,40 @@ export class EmployeeService {
   }
 
   // ─── Get single employee ──────────────────────────────────────────────────
-  async getById(id: string): Promise<IEmployee> {
+  async getById(id: string, requester: ITokenPayload): Promise<IEmployee> {
     const cacheKey = `${CACHE_PREFIX}:${id}`;
-    const cached = await cacheGet<IEmployee>(cacheKey);
-    if (cached) return cached;
+    let emp = await cacheGet<IEmployee>(cacheKey);
 
-    const emp = await Employee.findById(id)
-      .populate("userId", "name email role")
-      .populate("manager", "employeeId designation userId")
-      .lean();
+    if (!emp) {
+      const doc = await Employee.findById(id)
+        .populate("userId", "name email role")
+        .populate("manager", "employeeId designation userId")
+        .lean();
 
-    if (!emp) throw new AppError("Employee not found", 404);
+      if (!doc) throw new AppError("Employee not found", 404);
+      emp = doc as unknown as IEmployee;
+      await cacheSet(cacheKey, emp, CACHE_TTL);
+    }
 
-    await cacheSet(cacheKey, emp, CACHE_TTL);
-    return emp as unknown as IEmployee;
+    await this.assertCanView(emp, requester);
+    return emp;
+  }
+
+  // ─── Authorization: who may view a given employee record ─────────────────
+  // admin/hr: everyone. manager: self + direct reports. employee: self only.
+  private async assertCanView(emp: IEmployee, requester: ITokenPayload): Promise<void> {
+    if (requester.role === "admin" || requester.role === "hr") return;
+
+    const ownerId = ((emp.userId as unknown as { _id?: string })?._id ?? emp.userId).toString();
+    if (ownerId === requester.id) return;
+
+    if (requester.role === "manager") {
+      const managerRecord = await Employee.findOne({ userId: requester.id }).select("_id").lean();
+      const managerOfEmp = ((emp.manager as unknown as { _id?: string })?._id ?? emp.manager)?.toString();
+      if (managerRecord && managerOfEmp === managerRecord._id.toString()) return;
+    }
+
+    throw new AppError("You do not have permission to view this employee", 403);
   }
 
   // ─── Create employee ──────────────────────────────────────────────────────

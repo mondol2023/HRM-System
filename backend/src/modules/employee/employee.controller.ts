@@ -13,7 +13,7 @@ export class EmployeeController {
 
   async getOne(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
     try {
-      const emp = await employeeService.getById(req.params["id"]!);
+      const emp = await employeeService.getById(req.params["id"]!, req.user!);
       res.json({ success: true, message: "Employee fetched", data: emp });
     } catch (err) { next(err); }
   }
