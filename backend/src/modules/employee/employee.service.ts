@@ -1,135 +1,137 @@
 // src/modules/employee/employee.service.ts
 import mongoose from "mongoose";
 import { Employee } from "./employee.model";
-import { cacheGet, cacheSet, cacheDel, cacheInvalidatePattern } from "../../config/redis";
-import { IEmployee, IPaginatedResponse, IPaginationQuery, ITokenPayload, AppError } from "../../types";
 import { aiQueue } from "../ai/ai.queue";
+import { cache, queryFingerprint } from "../../core/cache/cacheService";
+import { CacheNamespace } from "../../constants/cacheKeys";
+import { AppError } from "../../core/errors/AppError";
+import { env } from "../../config/env";
+import { PRIVILEGED_ROLES } from "../../constants/enums";
+import type {
+  Department,
+  EmployeeSortField,
+  EmploymentStatus,
+  IEmployee,
+  IPaginatedResponse,
+  ITokenPayload,
+} from "../../types";
 
-const CACHE_TTL = 300; // 5 minutes
-const CACHE_PREFIX = "employees";
+export interface EmployeeListQuery {
+  page: number;
+  limit: number;
+  search?: string;
+  department?: Department;
+  status?: EmploymentStatus;
+  sortBy: EmployeeSortField;
+  sortOrder: "asc" | "desc";
+}
 
-export class EmployeeService {
-  // ─── List employees (paginated + cached) ──────────────────────────────────
-  async list(query: IPaginationQuery): Promise<IPaginatedResponse<IEmployee>> {
-    const { page = "1", limit = "20", search, department, status, sortBy = "createdAt", sortOrder = "desc" } = query;
+/** Notes are unbounded and unused by the list view. */
+const LIST_PROJECTION = { performanceNotes: 0 } as const;
 
-    const pageNum = Math.max(1, parseInt(page));
-    const limitNum = Math.min(100, parseInt(limit));
-    const skip = (pageNum - 1) * limitNum;
+/** A bare employee code short-circuits to an exact index hit; anything else is $text. */
+const EMPLOYEE_CODE = /^[A-Za-z0-9]{3,20}$/;
 
-    const cacheKey = `${CACHE_PREFIX}:list:${JSON.stringify(query)}`;
-    const cached = await cacheGet<IPaginatedResponse<IEmployee>>(cacheKey);
-    if (cached) return cached;
+const toId = (value: unknown): string | undefined => {
+  if (!value) return undefined;
+  const id = (value as { _id?: unknown })._id ?? value;
+  return String(id);
+};
 
-    const filter: mongoose.FilterQuery<IEmployee> = {};
-    if (department) filter.department = department;
-    if (status) filter.status = status;
-    if (search) {
-      filter.$or = [
-        { designation: { $regex: search, $options: "i" } },
-        { employeeId: { $regex: search, $options: "i" } },
-      ];
-    }
+const buildFilter = (query: EmployeeListQuery): mongoose.FilterQuery<IEmployee> => {
+  const filter: mongoose.FilterQuery<IEmployee> = {};
+  if (query.department) filter.department = query.department;
+  if (query.status) filter.status = query.status;
 
-    const projection = {
-      performanceNotes: 0, // exclude heavy field from list view
-    };
-
-    const [data, total] = await Promise.all([
-      Employee.find(filter, projection)
-        .populate("userId", "name email")
-        .populate("manager", "employeeId designation")
-        .sort({ [sortBy]: sortOrder === "asc" ? 1 : -1 })
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
-      Employee.countDocuments(filter),
-    ]);
-
-    const result: IPaginatedResponse<IEmployee> = {
-      data: data as unknown as IEmployee[],
-      total,
-      page: pageNum,
-      limit: limitNum,
-      totalPages: Math.ceil(total / limitNum),
-    };
-
-    await cacheSet(cacheKey, result, CACHE_TTL);
-    return result;
+  if (query.search) {
+    if (EMPLOYEE_CODE.test(query.search)) filter.employeeId = query.search.toUpperCase();
+    else filter.$text = { $search: query.search };
   }
+  return filter;
+};
 
-  // ─── Get single employee ──────────────────────────────────────────────────
+export const employeeService = {
+  async list(query: EmployeeListQuery): Promise<IPaginatedResponse<IEmployee>> {
+    return cache.getOrSet(
+      CacheNamespace.EMPLOYEE,
+      `list:${queryFingerprint(query as unknown as Record<string, unknown>)}`,
+      async () => {
+        const skip = (query.page - 1) * query.limit;
+        const filter = buildFilter(query);
+        const sort: Record<string, 1 | -1> = { [query.sortBy]: query.sortOrder === "asc" ? 1 : -1 };
+
+        const [data, total] = await Promise.all([
+          Employee.find(filter, LIST_PROJECTION)
+            .populate("userId", "name email")
+            .populate("manager", "employeeId designation")
+            .sort(sort)
+            .skip(skip)
+            .limit(query.limit)
+            .lean<IEmployee[]>(),
+          Employee.countDocuments(filter),
+        ]);
+
+        return {
+          data,
+          total,
+          page: query.page,
+          limit: query.limit,
+          totalPages: Math.ceil(total / query.limit),
+        };
+      },
+      { ttl: env.cacheTtl.list }
+    );
+  },
+
   async getById(id: string, requester: ITokenPayload): Promise<IEmployee> {
-    const cacheKey = `${CACHE_PREFIX}:${id}`;
-    let emp = await cacheGet<IEmployee>(cacheKey);
+    // Cached before authorization — the entry is requester-independent, the check is not.
+    const employee = await cache.getOrSet(
+      CacheNamespace.EMPLOYEE,
+      id,
+      async () =>
+        Employee.findById(id)
+          .populate("userId", "name email role")
+          .populate("manager", "employeeId designation userId")
+          .lean<IEmployee | null>(),
+      { ttl: env.cacheTtl.entity, negativeTtl: 15 }
+    );
 
-    if (!emp) {
-      const doc = await Employee.findById(id)
-        .populate("userId", "name email role")
-        .populate("manager", "employeeId designation userId")
-        .lean();
+    if (!employee) throw AppError.notFound("Employee");
+    await assertCanView(employee, requester);
+    return employee;
+  },
 
-      if (!doc) throw new AppError("Employee not found", 404);
-      emp = doc as unknown as IEmployee;
-      await cacheSet(cacheKey, emp, CACHE_TTL);
-    }
-
-    await this.assertCanView(emp, requester);
-    return emp;
-  }
-
-  // ─── Authorization: who may view a given employee record ─────────────────
-  // admin/hr: everyone. manager: self + direct reports. employee: self only.
-  private async assertCanView(emp: IEmployee, requester: ITokenPayload): Promise<void> {
-    if (requester.role === "admin" || requester.role === "hr") return;
-
-    const ownerId = ((emp.userId as unknown as { _id?: string })?._id ?? emp.userId).toString();
-    if (ownerId === requester.id) return;
-
-    if (requester.role === "manager") {
-      const managerRecord = await Employee.findOne({ userId: requester.id }).select("_id").lean();
-      const managerOfEmp = ((emp.manager as unknown as { _id?: string })?._id ?? emp.manager)?.toString();
-      if (managerRecord && managerOfEmp === managerRecord._id.toString()) return;
-    }
-
-    throw new AppError("You do not have permission to view this employee", 403);
-  }
-
-  // ─── Create employee ──────────────────────────────────────────────────────
   async create(data: Partial<IEmployee>): Promise<IEmployee> {
-    const emp = await Employee.create(data);
-    await cacheInvalidatePattern(`${CACHE_PREFIX}:list:*`);
-    return emp;
-  }
+    const employee = await Employee.create(data);
+    await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+    return employee;
+  },
 
-  // ─── Update employee ──────────────────────────────────────────────────────
   async update(id: string, data: Partial<IEmployee>): Promise<IEmployee> {
-    const emp = await Employee.findByIdAndUpdate(id, { $set: data }, { new: true, runValidators: true });
-    if (!emp) throw new AppError("Employee not found", 404);
+    const employee = await Employee.findByIdAndUpdate(
+      id,
+      { $set: data },
+      { new: true, runValidators: true }
+    ).lean<IEmployee | null>();
 
-    await Promise.all([
-      cacheInvalidatePattern(`${CACHE_PREFIX}:list:*`),
-      cacheDel(`${CACHE_PREFIX}:${id}`),
-    ]);
+    if (!employee) throw AppError.notFound("Employee");
+    await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+    return employee;
+  },
 
-    return emp;
-  }
-
-  // ─── Delete (soft via status) ─────────────────────────────────────────────
+  /** Soft delete: the record stays, the status changes. */
   async terminate(id: string): Promise<void> {
-    const emp = await Employee.findByIdAndUpdate(id, { status: "terminated" });
-    if (!emp) throw new AppError("Employee not found", 404);
-    await cacheInvalidatePattern(`${CACHE_PREFIX}:*`);
-  }
+    const employee = await Employee.findByIdAndUpdate(id, { $set: { status: "terminated" } })
+      .select("_id")
+      .lean();
 
-  // ─── Add performance note + queue AI sentiment ────────────────────────────
-  async addPerformanceNote(
-    employeeId: string,
-    note: string,
-    addedBy: string
-  ): Promise<IEmployee> {
-    const emp = await Employee.findByIdAndUpdate(
-      employeeId,
+    if (!employee) throw AppError.notFound("Employee");
+    await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+  },
+
+  async addPerformanceNote(id: string, note: string, addedBy: string): Promise<IEmployee> {
+    const employee = await Employee.findByIdAndUpdate(
+      id,
       {
         $push: {
           performanceNotes: {
@@ -142,40 +144,76 @@ export class EmployeeService {
       { new: true }
     );
 
-    if (!emp) throw new AppError("Employee not found", 404);
+    if (!employee) throw AppError.notFound("Employee");
 
-    // Queue background AI sentiment analysis
-    const lastNote = emp.performanceNotes[emp.performanceNotes.length - 1];
-    await aiQueue.add("sentiment", {
-      employeeId,
-      noteId: lastNote._id.toString(),
-      note,
-    });
+    const lastNote = employee.performanceNotes[employee.performanceNotes.length - 1];
 
-    // Also queue attrition risk refresh
-    await aiQueue.add("attrition", { employeeId });
-
-    await cacheDel(`${CACHE_PREFIX}:${employeeId}`);
-    return emp;
-  }
-
-  // ─── Dashboard stats ──────────────────────────────────────────────────────
-  async getStats(): Promise<Record<string, unknown>> {
-    const cacheKey = `${CACHE_PREFIX}:stats`;
-    const cached = await cacheGet<Record<string, unknown>>(cacheKey);
-    if (cached) return cached;
-
-    const [total, byDept, byStatus, highRisk] = await Promise.all([
-      Employee.countDocuments(),
-      Employee.aggregate([{ $group: { _id: "$department", count: { $sum: 1 } } }]),
-      Employee.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
-      Employee.countDocuments({ attritionRisk: { $gte: 0.7 } }),
+    // AI runs off-request: the caller never waits on OpenAI.
+    await Promise.all([
+      aiQueue.sentiment({ employeeId: id, noteId: String(lastNote?._id), note }),
+      aiQueue.attrition(id),
+      cache.invalidate(CacheNamespace.EMPLOYEE),
     ]);
 
-    const stats = { total, byDepartment: byDept, byStatus, highAttritionRisk: highRisk };
-    await cacheSet(cacheKey, stats, 60);
-    return stats;
-  }
-}
+    return employee;
+  },
 
-export const employeeService = new EmployeeService();
+  async getStats(): Promise<Record<string, unknown>> {
+    return cache.getOrSet(
+      CacheNamespace.EMPLOYEE_STATS,
+      "global",
+      async () => {
+        // One pass over the collection instead of four separate scans.
+        const [result] = await Employee.aggregate<{
+          total: [{ count: number }?];
+          byDepartment: { _id: string; count: number }[];
+          byStatus: { _id: string; count: number }[];
+          highAttritionRisk: [{ count: number }?];
+        }>([
+          {
+            $facet: {
+              total: [{ $count: "count" }],
+              byDepartment: [{ $group: { _id: "$department", count: { $sum: 1 } } }],
+              byStatus: [{ $group: { _id: "$status", count: { $sum: 1 } } }],
+              highAttritionRisk: [{ $match: { attritionRisk: { $gte: 0.7 } } }, { $count: "count" }],
+            },
+          },
+        ]);
+
+        return {
+          total: result?.total[0]?.count ?? 0,
+          byDepartment: result?.byDepartment ?? [],
+          byStatus: result?.byStatus ?? [],
+          highAttritionRisk: result?.highAttritionRisk[0]?.count ?? 0,
+        };
+      },
+      { ttl: env.cacheTtl.stats }
+    );
+  },
+};
+
+/**
+ * Per-record access control. admin/hr see everyone, a manager sees themselves and
+ * their direct reports, everyone else sees only their own record. Without this
+ * any authenticated user could read any record by id.
+ */
+async function assertCanView(employee: IEmployee, requester: ITokenPayload): Promise<void> {
+  if (PRIVILEGED_ROLES.includes(requester.role)) return;
+  if (toId(employee.userId) === requester.id) return;
+
+  if (requester.role === "manager") {
+    const managerRecordId = await cache.getOrSet(
+      CacheNamespace.EMPLOYEE,
+      `by-user:${requester.id}`,
+      async () => {
+        const record = await Employee.findOne({ userId: requester.id }).select("_id").lean();
+        return record ? String(record._id) : null;
+      },
+      { ttl: env.cacheTtl.entity, negativeTtl: 30 }
+    );
+
+    if (managerRecordId && toId(employee.manager) === managerRecordId) return;
+  }
+
+  throw AppError.forbidden("You do not have permission to view this employee");
+}

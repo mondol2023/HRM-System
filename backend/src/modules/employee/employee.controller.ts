@@ -1,62 +1,43 @@
 // src/modules/employee/employee.controller.ts
-import { Response, NextFunction } from "express";
-import { AuthRequest, IPaginationQuery } from "../../types";
-import { employeeService } from "./employee.service";
+import type { Response } from "express";
+import { employeeService, type EmployeeListQuery } from "./employee.service";
+import { created, ok, paginated } from "../../core/http/apiResponse";
+import type { AuthRequest, IEmployee } from "../../types";
 
-export class EmployeeController {
-  async list(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const result = await employeeService.list(req.query as IPaginationQuery);
-      res.json({ success: true, message: "Employees fetched", data: result });
-    } catch (err) { next(err); }
-  }
+export const employeeController = {
+  async list(req: AuthRequest, res: Response): Promise<void> {
+    const result = await employeeService.list(req.query as unknown as EmployeeListQuery);
+    paginated(res, result, "Employees fetched");
+  },
 
-  async getOne(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const emp = await employeeService.getById(req.params["id"]!, req.user!);
-      res.json({ success: true, message: "Employee fetched", data: emp });
-    } catch (err) { next(err); }
-  }
+  async getOne(req: AuthRequest, res: Response): Promise<void> {
+    const employee = await employeeService.getById(req.params["id"]!, req.user!);
+    ok(res, employee, "Employee fetched");
+  },
 
-  async create(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const emp = await employeeService.create(req.body);
-      res.status(201).json({ success: true, message: "Employee created", data: emp });
-    } catch (err) { next(err); }
-  }
+  async create(req: AuthRequest, res: Response): Promise<void> {
+    const employee = await employeeService.create(req.body as Partial<IEmployee>);
+    created(res, employee, "Employee created");
+  },
 
-  async update(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const emp = await employeeService.update(req.params["id"]!, req.body);
-      res.json({ success: true, message: "Employee updated", data: emp });
-    } catch (err) { next(err); }
-  }
+  async update(req: AuthRequest, res: Response): Promise<void> {
+    const employee = await employeeService.update(req.params["id"]!, req.body as Partial<IEmployee>);
+    ok(res, employee, "Employee updated");
+  },
 
-  async terminate(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      await employeeService.terminate(req.params["id"]!);
-      res.json({ success: true, message: "Employee terminated" });
-    } catch (err) { next(err); }
-  }
+  async terminate(req: AuthRequest, res: Response): Promise<void> {
+    await employeeService.terminate(req.params["id"]!);
+    ok(res, null, "Employee terminated");
+  },
 
-  async addNote(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const { note } = req.body as { note: string };
-      const emp = await employeeService.addPerformanceNote(
-        req.params["id"]!,
-        note,
-        req.user!.id
-      );
-      res.status(201).json({ success: true, message: "Note added. AI analysis queued.", data: emp });
-    } catch (err) { next(err); }
-  }
+  async addNote(req: AuthRequest, res: Response): Promise<void> {
+    const { note } = req.body as { note: string };
+    const employee = await employeeService.addPerformanceNote(req.params["id"]!, note, req.user!.id);
+    created(res, employee, "Note added. AI analysis queued.");
+  },
 
-  async stats(_req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const data = await employeeService.getStats();
-      res.json({ success: true, message: "Stats fetched", data });
-    } catch (err) { next(err); }
-  }
-}
-
-export const employeeController = new EmployeeController();
+  async stats(_req: AuthRequest, res: Response): Promise<void> {
+    const stats = await employeeService.getStats();
+    ok(res, stats, "Stats fetched");
+  },
+};

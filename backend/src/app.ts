@@ -1,60 +1,51 @@
 // src/app.ts
-import express, { Application } from "express";
+import express, { type Application } from "express";
 import helmet from "helmet";
 import cors from "cors";
+import compression from "compression";
 import cookieParser from "cookie-parser";
-import morgan from "morgan";
 
+import { env } from "./config/env";
+import { requestContext } from "./middleware/requestContext.middleware";
+import { httpLogger } from "./middleware/httpLogger.middleware";
+import { sanitize } from "./middleware/sanitize.middleware";
+import { notFound } from "./middleware/notFound.middleware";
 import { errorHandler } from "./middleware/error.middleware";
-import { logger } from "./config/logger";
 
-import authRoutes from "./modules/auth/auth.routes";
-import employeeRoutes from "./modules/employee/employee.routes";
-import aiRoutes from "./modules/ai/ai.routes";
+import healthRoutes from "./modules/health/health.routes";
+import apiRoutes from "./routes/index";
 
 export const createApp = (): Application => {
   const app = express();
 
-  // ─── Security headers ───────────────────────────────────────────────────────
+  // Accurate hop count so req.ip reflects the real client, not a spoofable header.
+  app.set("trust proxy", env.trustProxyHops);
+  app.disable("x-powered-by");
+
   app.use(helmet());
+  app.use(compression());
   app.use(
     cors({
-      origin: process.env.CLIENT_URL || "http://localhost:5173",
+      origin: env.corsOrigins,
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-      allowedHeaders: ["Content-Type", "Authorization"],
+      allowedHeaders: ["Content-Type", "Authorization", "x-request-id"],
+      exposedHeaders: ["x-request-id"],
     })
   );
 
-  // ─── Body parsers ───────────────────────────────────────────────────────────
-  app.use(express.json({ limit: "10mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-  app.use(cookieParser(process.env.COOKIE_SECRET));
+  app.use(express.json({ limit: env.bodyLimit }));
+  app.use(express.urlencoded({ extended: true, limit: env.bodyLimit }));
+  app.use(cookieParser(env.auth.cookieSecret));
 
-  // ─── HTTP logging ───────────────────────────────────────────────────────────
-  app.use(
-    morgan("combined", {
-      stream: { write: (msg) => logger.http(msg.trim()) },
-      skip: () => process.env.NODE_ENV === "test",
-    })
-  );
+  app.use(requestContext);
+  app.use(httpLogger);
+  app.use(sanitize);
 
-  // ─── Health check ───────────────────────────────────────────────────────────
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
-  });
+  app.use("/health", healthRoutes);
+  app.use("/api/v1", apiRoutes);
 
-  // ─── API Routes ─────────────────────────────────────────────────────────────
-  app.use("/api/v1/auth", authRoutes);
-  app.use("/api/v1/employees", employeeRoutes);
-  app.use("/api/v1/ai", aiRoutes);
-
-  // ─── 404 handler ────────────────────────────────────────────────────────────
-  app.use((_req, res) => {
-    res.status(404).json({ success: false, message: "Route not found" });
-  });
-
-  // ─── Global error handler ───────────────────────────────────────────────────
+  app.use(notFound);
   app.use(errorHandler);
 
   return app;

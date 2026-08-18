@@ -1,29 +1,68 @@
 // src/modules/ai/ai.service.ts
 import OpenAI from "openai";
 import pdfParse from "pdf-parse";
-import { IResumeParseResult, ISentimentResult, IAttritionResult, AppError } from "../../types";
+import { env } from "../../config/env";
 import { logger } from "../../config/logger";
+import { AppError } from "../../core/errors/AppError";
+import type { IAttritionResult, IResumeParseResult, ISentimentResult } from "../../types";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: env.openai.apiKey,
+  timeout: env.openai.timeoutMs,
+  maxRetries: env.openai.maxRetries,
+});
 
-export class AiService {
-  // ─── Resume Parsing ───────────────────────────────────────────────────────
-  async parseResume(fileBuffer: Buffer, mimeType: string): Promise<IResumeParseResult> {
-    let text = "";
+const PDF_MAGIC = Buffer.from("%PDF");
 
-    if (mimeType === "application/pdf") {
-      const parsed = await pdfParse(fileBuffer);
-      text = parsed.text;
-    } else if (mimeType === "text/plain") {
+/** Content sniff, not just the declared mimetype — an uploader can lie about it. */
+const isPdf = (buffer: Buffer): boolean => buffer.subarray(0, 4).equals(PDF_MAGIC);
+
+const isPlainText = (buffer: Buffer): boolean => {
+  // Reject anything with embedded nulls / control bytes — not real text.
+  const sample = buffer.subarray(0, 1000);
+  for (const byte of sample) {
+    if (byte === 0) return false;
+  }
+  return true;
+};
+
+const extractJson = <T>(content: string | null | undefined, context: string): T => {
+  if (!content) throw AppError.upstream(`OpenAI returned an empty response (${context})`);
+  try {
+    return JSON.parse(content) as T;
+  } catch {
+    throw AppError.upstream(`OpenAI returned malformed JSON (${context})`);
+  }
+};
+
+const chatJson = async (prompt: string, maxTokens: number, temperature: number): Promise<string | null> => {
+  const response = await openai.chat.completions.create({
+    model: env.openai.model,
+    messages: [{ role: "user", content: prompt }],
+    temperature,
+    max_tokens: maxTokens,
+    response_format: { type: "json_object" },
+  });
+  return response.choices[0]?.message?.content ?? null;
+};
+
+export const aiService = {
+  async parseResume(fileBuffer: Buffer, declaredMimeType: string): Promise<IResumeParseResult> {
+    let text: string;
+
+    if (declaredMimeType === "application/pdf") {
+      if (!isPdf(fileBuffer)) throw AppError.badRequest("File is not a valid PDF");
+      text = (await pdfParse(fileBuffer)).text;
+    } else if (declaredMimeType === "text/plain") {
+      if (!isPlainText(fileBuffer)) throw AppError.badRequest("File is not valid plain text");
       text = fileBuffer.toString("utf-8");
     } else {
-      throw new AppError("Only PDF or TXT resumes are supported", 400);
+      throw AppError.badRequest("Only PDF or TXT resumes are supported");
     }
 
-    if (text.length < 50) throw new AppError("Resume content too short to parse", 422);
+    if (text.trim().length < 50) throw AppError.validation("Resume content too short to parse");
 
-    const prompt = `
-You are an expert HR recruiter and resume parser.
+    const prompt = `You are an expert HR recruiter and resume parser.
 Parse the following resume text and extract structured information.
 Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
 {
@@ -41,32 +80,20 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
 Resume text:
 """
 ${text.slice(0, 6000)}
-"""
-    `;
+"""`;
 
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-        max_tokens: 1000,
-        response_format: { type: "json_object" },
-      });
-
-      const content = response.choices[0]?.message?.content;
-      if (!content) throw new AppError("OpenAI returned empty response", 502);
-
-      return JSON.parse(content) as IResumeParseResult;
-    } catch (err) {
-      logger.error("Resume parse OpenAI error:", err);
-      throw new AppError("AI resume parsing failed", 502);
+      const content = await chatJson(prompt, 1000, 0.2);
+      return extractJson<IResumeParseResult>(content, "resume parse");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      logger.error("Resume parse OpenAI call failed", { error: (error as Error).message });
+      throw AppError.upstream("AI resume parsing failed");
     }
-  }
+  },
 
-  // ─── Sentiment Analysis ───────────────────────────────────────────────────
   async analyzeSentiment(note: string): Promise<ISentimentResult> {
-    const prompt = `
-Analyze the sentiment of the following employee performance note.
+    const prompt = `Analyze the sentiment of the following employee performance note.
 Return ONLY a valid JSON object:
 {
   "sentiment": "positive" | "neutral" | "negative",
@@ -75,41 +102,33 @@ Return ONLY a valid JSON object:
 }
 
 Performance note:
-"${note}"
-    `;
+"${note}"`;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      max_tokens: 300,
-      response_format: { type: "json_object" },
-    });
+    try {
+      const content = await chatJson(prompt, 300, 0.1);
+      return extractJson<ISentimentResult>(content, "sentiment");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      logger.error("Sentiment OpenAI call failed", { error: (error as Error).message });
+      throw AppError.upstream("AI sentiment analysis failed");
+    }
+  },
 
-    const content = response.choices[0]?.message?.content;
-    if (!content) throw new AppError("OpenAI returned empty response", 502);
-
-    return JSON.parse(content) as ISentimentResult;
-  }
-
-  // ─── Attrition Risk Prediction ────────────────────────────────────────────
-  async predictAttrition(employeeData: {
-    tenure: number; // months
+  async predictAttrition(input: {
+    tenureMonths: number;
     salary: number;
     department: string;
     designation: string;
     status: string;
-    recentSentiments: number[]; // array of sentiment scores
+    recentSentiments: number[];
     noteCount: number;
   }): Promise<IAttritionResult> {
     const avgSentiment =
-      employeeData.recentSentiments.length > 0
-        ? employeeData.recentSentiments.reduce((a, b) => a + b, 0) /
-          employeeData.recentSentiments.length
+      input.recentSentiments.length > 0
+        ? input.recentSentiments.reduce((a, b) => a + b, 0) / input.recentSentiments.length
         : 0;
 
-    const prompt = `
-You are an HR analytics expert specializing in employee retention.
+    const prompt = `You are an HR analytics expert specializing in employee retention.
 Analyze the following employee data and predict attrition risk.
 Return ONLY a valid JSON object:
 {
@@ -119,28 +138,21 @@ Return ONLY a valid JSON object:
 }
 
 Employee data:
-- Tenure: ${employeeData.tenure} months
-- Salary: $${employeeData.salary}
-- Department: ${employeeData.department}
-- Designation: ${employeeData.designation}
-- Status: ${employeeData.status}
+- Tenure: ${input.tenureMonths} months
+- Salary: $${input.salary}
+- Department: ${input.department}
+- Designation: ${input.designation}
+- Status: ${input.status}
 - Average performance sentiment: ${avgSentiment.toFixed(2)} (scale: -1 negative to +1 positive)
-- Number of performance notes: ${employeeData.noteCount}
-    `;
+- Number of performance notes: ${input.noteCount}`;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 400,
-      response_format: { type: "json_object" },
-    });
-
-    const content = response.choices[0]?.message?.content;
-    if (!content) throw new AppError("OpenAI returned empty response", 502);
-
-    return JSON.parse(content) as IAttritionResult;
-  }
-}
-
-export const aiService = new AiService();
+    try {
+      const content = await chatJson(prompt, 400, 0.2);
+      return extractJson<IAttritionResult>(content, "attrition");
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      logger.error("Attrition OpenAI call failed", { error: (error as Error).message });
+      throw AppError.upstream("AI attrition prediction failed");
+    }
+  },
+};

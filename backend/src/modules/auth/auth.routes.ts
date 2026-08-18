@@ -4,20 +4,23 @@ import { authController } from "./auth.controller";
 import { authenticate } from "../../middleware/auth.middleware";
 import { validate } from "../../middleware/validate.middleware";
 import { authLimiter } from "../../middleware/rateLimit.middleware";
-import { registerSchema, loginSchema, changePasswordSchema } from "./auth.schema";
+import { asyncHandler } from "../../core/http/asyncHandler";
+import { changePasswordSchema, loginSchema, refreshSchema, registerSchema } from "./auth.schema";
 
 const router = Router();
 
-router.post("/register", authLimiter, validate(registerSchema), authController.register.bind(authController));
-router.post("/login", authLimiter, validate(loginSchema), authController.login.bind(authController));
-router.post("/logout", authenticate, authController.logout.bind(authController));
-router.get("/me", authenticate, authController.getMe.bind(authController));
+router.post("/register", authLimiter, validate(registerSchema), asyncHandler(authController.register));
+router.post("/login", authLimiter, validate(loginSchema), asyncHandler(authController.login));
+router.post("/refresh", authLimiter, validate(refreshSchema), asyncHandler(authController.refresh));
+router.post("/logout", asyncHandler(authController.logout));
+
+router.get("/me", authenticate, asyncHandler(authController.getMe));
 router.patch(
   "/change-password",
   authenticate,
   authLimiter,
   validate(changePasswordSchema),
-  authController.changePassword.bind(authController)
+  asyncHandler(authController.changePassword)
 );
 
 export default router;

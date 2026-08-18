@@ -1,9 +1,15 @@
 // src/types/index.ts
 import type { Request } from "express";
 import type { Document, Types } from "mongoose";
-import type { Department, EmploymentStatus, Sentiment, UserRole } from "../constants/enums";
+import type {
+  Department,
+  EmployeeSortField,
+  EmploymentStatus,
+  Sentiment,
+  UserRole,
+} from "../constants/enums";
 
-export type { Department, EmploymentStatus, Sentiment, UserRole };
+export type { Department, EmployeeSortField, EmploymentStatus, Sentiment, UserRole };
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 export interface ITokenPayload {

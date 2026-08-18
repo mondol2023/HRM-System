@@ -1,115 +1,67 @@
 // src/modules/ai/ai.queue.ts
-import Bull, { type Queue, Job } from "bull";
-import { Employee } from "../employee/employee.model";
-import { aiService } from "./ai.service";
+//
+// Producer side only. The API enqueues; a separate worker process consumes, so
+// a slow OpenAI call can never occupy a request thread.
+//
+// Two queues, not one queue with two job names: BullMQ concurrency is set per
+// Worker, and sentiment/attrition need different concurrency budgets.
+import { Queue, type JobsOptions } from "bullmq";
+import { getRedis } from "../../config/redis";
+import { env } from "../../config/env";
 import { logger } from "../../config/logger";
-import mongoose from "mongoose";
 
-interface SentimentJobData {
+export const QUEUE_PREFIX = `${env.redis.keyPrefix}:bull`;
+export const SENTIMENT_QUEUE = "ai-sentiment";
+export const ATTRITION_QUEUE = "ai-attrition";
+
+export interface SentimentJobData {
   employeeId: string;
   noteId: string;
   note: string;
 }
 
-interface AttritionJobData {
+export interface AttritionJobData {
   employeeId: string;
 }
 
-// Singleton queue instance
-let queue: Queue;
+export const defaultJobOptions: JobsOptions = {
+  attempts: 3,
+  backoff: { type: "exponential", delay: 2000 },
+  removeOnComplete: { count: 100, age: 3600 },
+  removeOnFail: { count: 500 },
+};
 
-export const initQueues = (): void => {
-  const redisConfig = {
-    host: process.env.REDIS_HOST || "localhost",
-    port: parseInt(process.env.REDIS_PORT || "6379"),
-    password: process.env.REDIS_PASSWORD,
-  };
+let sentimentQueue: Queue<SentimentJobData> | null = null;
+let attritionQueue: Queue<AttritionJobData> | null = null;
 
-  queue = new Bull("ai-tasks", {
-    redis: redisConfig,
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: { type: "exponential", delay: 2000 },
-      removeOnComplete: 100,
-      removeOnFail: 50,
-    },
-  });
-
-  // ─── Process sentiment jobs ─────────────────────────────────────────────
-  queue.process("sentiment", 3, async (job: Job<SentimentJobData>) => {
-    const { employeeId, noteId, note } = job.data;
-    logger.info(`[Queue] Analyzing sentiment for note ${noteId}`);
-
-    const result = await aiService.analyzeSentiment(note);
-
-    await Employee.updateOne(
-      { _id: employeeId, "performanceNotes._id": new mongoose.Types.ObjectId(noteId) },
-      {
-        $set: {
-          "performanceNotes.$.sentiment": result.sentiment,
-          "performanceNotes.$.sentimentScore": result.score,
-        },
-      }
-    );
-
-    logger.info(`[Queue] Sentiment saved for note ${noteId}: ${result.sentiment}`);
-    return result;
-  });
-
-  // ─── Process attrition jobs ─────────────────────────────────────────────
-  queue.process("attrition", 2, async (job: Job<AttritionJobData>) => {
-    const { employeeId } = job.data;
-    logger.info(`[Queue] Predicting attrition for employee ${employeeId}`);
-
-    const emp = await Employee.findById(employeeId).populate("userId");
-    if (!emp) {
-      logger.warn(`[Queue] Employee ${employeeId} not found for attrition`);
-      return;
-    }
-
-    const tenureMonths = Math.floor(
-      (Date.now() - emp.joiningDate.getTime()) / (1000 * 60 * 60 * 24 * 30)
-    );
-
-    const recentSentiments = emp.performanceNotes
-      .filter((n) => n.sentimentScore !== undefined)
-      .slice(-10)
-      .map((n) => n.sentimentScore as number);
-
-    const result = await aiService.predictAttrition({
-      tenure: tenureMonths,
-      salary: emp.salary,
-      department: emp.department,
-      designation: emp.designation,
-      status: emp.status,
-      recentSentiments,
-      noteCount: emp.performanceNotes.length,
-    });
-
-    await Employee.findByIdAndUpdate(employeeId, {
-      attritionRisk: result.risk,
-      attritionRiskUpdatedAt: new Date(),
-    });
-
-    logger.info(`[Queue] Attrition risk for ${employeeId}: ${result.risk}`);
-    return result;
-  });
-
-  // ─── Queue event listeners ──────────────────────────────────────────────
-  queue.on("failed", (job, err) => {
-    logger.error(`[Queue] Job ${job.id} (${job.name}) failed:`, err.message);
-  });
-
-  queue.on("completed", (job) => {
-    logger.debug(`[Queue] Job ${job.id} (${job.name}) completed`);
-  });
-
-  logger.info("✅ AI Queue initialized");
+const makeQueue = <T>(name: string): Queue<T> => {
+  const queue = new Queue<T>(name, { connection: getRedis("queue"), prefix: QUEUE_PREFIX, defaultJobOptions });
+  queue.on("error", (error: Error) => logger.error(`Queue[${name}] error`, { error: error.message }));
+  return queue;
 };
 
 export const aiQueue = {
-  add: async (name: string, data: SentimentJobData | AttritionJobData) => {
-    if (!queue) throw new Error("Queue not initialized");
-    return queue.add(name, data);
+  async sentiment(data: SentimentJobData): Promise<void> {
+    sentimentQueue ??= makeQueue<SentimentJobData>(SENTIMENT_QUEUE);
+    await sentimentQueue.add("sentiment", data);
+  },
+
+  /**
+   * Debounced: one pending recompute per employee. Notes often arrive in bursts
+   * and only the final state matters, so a fixed jobId collapses them.
+   */
+  async attrition(employeeId: string): Promise<void> {
+    attritionQueue ??= makeQueue<AttritionJobData>(ATTRITION_QUEUE);
+    await attritionQueue.add(
+      "attrition",
+      { employeeId },
+      { jobId: `attrition:${employeeId}`, delay: 5000 }
+    );
+  },
+
+  async close(): Promise<void> {
+    await Promise.all([sentimentQueue?.close(), attritionQueue?.close()]);
+    sentimentQueue = null;
+    attritionQueue = null;
   },
 };

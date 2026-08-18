@@ -1,43 +1,54 @@
 // src/modules/employee/employee.schema.ts
 import Joi from "joi";
+import {
+  DEPARTMENTS,
+  EMPLOYEE_SORT_FIELDS,
+  EMPLOYMENT_STATUSES,
+  asMutable,
+} from "../../constants/enums";
+
+const objectId = Joi.string().hex().length(24);
+const department = Joi.string().valid(...DEPARTMENTS);
+const status = Joi.string().valid(...EMPLOYMENT_STATUSES);
 
 export const createEmployeeSchema = Joi.object({
-  userId: Joi.string().hex().length(24).required(),
+  userId: objectId.required(),
   employeeId: Joi.string().uppercase().alphanum().min(3).max(20).required(),
-  department: Joi.string()
-    .valid("engineering", "hr", "finance", "marketing", "operations", "sales", "legal")
-    .required(),
+  department: department.required(),
   designation: Joi.string().trim().min(2).max(100).required(),
-  salary: Joi.number().positive().required(),
+  salary: Joi.number().positive().max(1e9).required(),
   joiningDate: Joi.date().iso().required(),
-  status: Joi.string()
-    .valid("active", "on_leave", "terminated", "probation")
-    .default("active"),
-  skills: Joi.array().items(Joi.string().trim()).default([]),
-  manager: Joi.string().hex().length(24).optional(),
+  status: status.default("active"),
+  skills: Joi.array().items(Joi.string().trim().max(50)).max(50).default([]),
+  manager: objectId.optional(),
 });
 
 export const updateEmployeeSchema = Joi.object({
-  department: Joi.string().valid(
-    "engineering", "hr", "finance", "marketing", "operations", "sales", "legal"
-  ),
+  department,
   designation: Joi.string().trim().min(2).max(100),
-  salary: Joi.number().positive(),
-  status: Joi.string().valid("active", "on_leave", "terminated", "probation"),
-  skills: Joi.array().items(Joi.string().trim()),
-  manager: Joi.string().hex().length(24).allow(null),
+  salary: Joi.number().positive().max(1e9),
+  status,
+  skills: Joi.array().items(Joi.string().trim().max(50)).max(50),
+  manager: objectId.allow(null),
 }).min(1);
 
 export const addPerformanceNoteSchema = Joi.object({
   note: Joi.string().trim().min(10).max(2000).required(),
 });
 
+export const idParamSchema = Joi.object({
+  id: objectId.required(),
+});
+
 export const listQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
+  // Capped: an unbounded limit is a trivial memory/CPU amplifier.
   limit: Joi.number().integer().min(1).max(100).default(20),
   search: Joi.string().trim().max(100).optional(),
-  department: Joi.string().optional(),
-  status: Joi.string().optional(),
-  sortBy: Joi.string().valid("joiningDate", "salary", "attritionRisk", "createdAt").default("createdAt"),
+  department,
+  status,
+  sortBy: Joi.string()
+    .valid(...asMutable(EMPLOYEE_SORT_FIELDS))
+    .default("createdAt"),
   sortOrder: Joi.string().valid("asc", "desc").default("desc"),
 });

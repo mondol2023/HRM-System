@@ -1,46 +1,33 @@
 // src/modules/ai/ai.controller.ts
-import { Response, NextFunction } from "express";
+import type { Response } from "express";
 import multer from "multer";
-import { AuthRequest } from "../../types";
 import { aiService } from "./ai.service";
-import { AppError } from "../../types";
+import { env } from "../../config/env";
+import { AppError } from "../../core/errors/AppError";
+import { ok } from "../../core/http/apiResponse";
+import type { AuthRequest } from "../../types";
 
-// Memory storage for file upload (buffer passed directly to AI)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: env.openai.resumeMaxBytes },
   fileFilter: (_req, file, cb) => {
     const allowed = ["application/pdf", "text/plain"];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new AppError("Only PDF or TXT files allowed", 400));
-    }
+    cb(null, allowed.includes(file.mimetype));
   },
 });
 
-export class AiController {
-  // Expose multer middleware for routing
-  uploadMiddleware = upload.single("resume");
+export const aiController = {
+  uploadMiddleware: upload.single("resume"),
 
-  async parseResume(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      if (!req.file) throw new AppError("No resume file uploaded", 400);
-      const result = await aiService.parseResume(req.file.buffer, req.file.mimetype);
-      res.json({ success: true, message: "Resume parsed successfully", data: result });
-    } catch (err) { next(err); }
-  }
+  async parseResume(req: AuthRequest, res: Response): Promise<void> {
+    if (!req.file) throw AppError.badRequest("No resume file uploaded (PDF or TXT, field name 'resume')");
+    const result = await aiService.parseResume(req.file.buffer, req.file.mimetype);
+    ok(res, result, "Resume parsed successfully");
+  },
 
-  async analyzeSentiment(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
-    try {
-      const { note } = req.body as { note: string };
-      if (!note || note.trim().length < 10) {
-        throw new AppError("Note must be at least 10 characters", 422);
-      }
-      const result = await aiService.analyzeSentiment(note);
-      res.json({ success: true, message: "Sentiment analyzed", data: result });
-    } catch (err) { next(err); }
-  }
-}
-
-export const aiController = new AiController();
+  async analyzeSentiment(req: AuthRequest, res: Response): Promise<void> {
+    const { note } = req.body as { note: string };
+    const result = await aiService.analyzeSentiment(note);
+    ok(res, result, "Sentiment analyzed");
+  },
+};

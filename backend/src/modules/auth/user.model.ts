@@ -1,49 +1,40 @@
 // src/modules/auth/user.model.ts
 import mongoose, { Schema } from "mongoose";
 import bcrypt from "bcryptjs";
-import { IUser } from "../../types";
+import { env } from "../../config/env";
+import { USER_ROLES, asMutable } from "../../constants/enums";
+import type { IUser } from "../../types";
 
 const UserSchema = new Schema<IUser>(
   {
     name: { type: String, required: true, trim: true, maxlength: 100 },
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      lowercase: true,
-      trim: true,
-      index: true,
-    },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true, minlength: 8, select: false },
-    role: {
-      type: String,
-      enum: ["admin", "hr", "manager", "employee"],
-      default: "employee",
-    },
-    isActive: { type: Boolean, default: true, index: true },
+    role: { type: String, enum: asMutable(USER_ROLES), default: "employee" },
+    isActive: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
 
-// Hash password before save
+// Login filters on both fields together.
+UserSchema.index({ email: 1, isActive: 1 });
+
 UserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
-  const rounds = parseInt(process.env.BCRYPT_ROUNDS || "12");
-  this.password = await bcrypt.hash(this.password, rounds);
+  this.password = await bcrypt.hash(this.password, env.auth.bcryptRounds);
   next();
 });
 
-UserSchema.methods.comparePassword = async function (
-  candidate: string
-): Promise<boolean> {
+UserSchema.methods["comparePassword"] = async function (this: IUser, candidate: string): Promise<boolean> {
   return bcrypt.compare(candidate, this.password);
 };
 
-// Never expose password in JSON output
 UserSchema.set("toJSON", {
-  transform: (_doc, ret: Record<string, unknown>) => {
-    ret["password"] = undefined;
-    return ret;
+  transform: (_doc, ret) => {
+    const obj = ret as unknown as Record<string, unknown>;
+    delete obj["password"];
+    delete obj["__v"];
+    return obj;
   },
 });
 

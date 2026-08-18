@@ -3,24 +3,27 @@ import { Router } from "express";
 import { aiController } from "./ai.controller";
 import { authenticate, authorize } from "../../middleware/auth.middleware";
 import { aiLimiter } from "../../middleware/rateLimit.middleware";
+import { validate } from "../../middleware/validate.middleware";
+import { asyncHandler } from "../../core/http/asyncHandler";
+import { sentimentSchema } from "./ai.schema";
+import type { AuthRequest } from "../../types";
 
 const router = Router();
 
 router.use(authenticate, aiLimiter);
 
-// Resume parsing — HR and admin only
 router.post(
   "/parse-resume",
   authorize("admin", "hr"),
   aiController.uploadMiddleware,
-  aiController.parseResume.bind(aiController)
+  asyncHandler<AuthRequest>(aiController.parseResume)
 );
 
-// Direct sentiment analysis endpoint
 router.post(
   "/sentiment",
   authorize("admin", "hr", "manager"),
-  aiController.analyzeSentiment.bind(aiController)
+  validate(sentimentSchema),
+  asyncHandler<AuthRequest>(aiController.analyzeSentiment)
 );
 
 export default router;

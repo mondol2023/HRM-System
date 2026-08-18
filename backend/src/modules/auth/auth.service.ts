@@ -1,72 +1,85 @@
 // src/modules/auth/auth.service.ts
-import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { User } from "./user.model";
-import { IUser, ITokenPayload, AppError } from "../../types";
+import { tokenService, type TokenPair } from "./token.service";
+import { AppError } from "../../core/errors/AppError";
+import { cache } from "../../core/cache/cacheService";
+import { CacheNamespace } from "../../constants/cacheKeys";
+import { env } from "../../config/env";
+import type { IUser } from "../../types";
 
-const JWT_SECRET = process.env.JWT_SECRET as string;
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+/**
+ * Compared against on unknown emails so a failed login costs the same time as a
+ * successful one — otherwise response latency enumerates valid accounts.
+ */
+const DUMMY_HASH = bcrypt.hashSync("timing-equalizer", env.auth.bcryptRounds);
 
-export class AuthService {
-  generateToken(payload: ITokenPayload): string {
-    return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN } as jwt.SignOptions);
-  }
+export interface AuthResult extends TokenPair {
+  user: IUser;
+}
 
-  async register(data: {
-    name: string;
-    email: string;
-    password: string;
-    role?: IUser["role"];
-  }): Promise<{ user: IUser; token: string }> {
-    const existing = await User.findOne({ email: data.email });
-    if (existing) throw new AppError("Email already in use", 409);
+export const authService = {
+  async register(data: { name: string; email: string; password: string }): Promise<AuthResult> {
+    // The unique index is the real guard; this is only for a friendlier message.
+    const existing = await User.exists({ email: data.email });
+    if (existing) throw AppError.conflict("Email already in use");
 
-    const user = await User.create(data);
+    // `role` is never taken from input — see auth.schema.ts.
+    const user = await User.create({ ...data, role: "employee" });
+    const tokens = await tokenService.issue(tokenService.buildPayload(user));
+    return { user, ...tokens };
+  },
 
-    const token = this.generateToken({
-      id: user._id.toString(),
-      email: user.email,
-      role: user.role,
-    });
-
-    return { user, token };
-  }
-
-  async login(email: string, password: string): Promise<{ user: IUser; token: string }> {
+  async login(email: string, password: string): Promise<AuthResult> {
     const user = await User.findOne({ email, isActive: true }).select("+password");
-    if (!user) throw new AppError("Invalid credentials", 401);
 
-    const valid = await user.comparePassword(password);
-    if (!valid) throw new AppError("Invalid credentials", 401);
+    if (!user) {
+      await bcrypt.compare(password, DUMMY_HASH);
+      throw AppError.unauthorized("Invalid credentials");
+    }
 
-    const token = this.generateToken({
-      id: user._id.toString(),
-      email: user.email,
-      role: user.role,
+    if (!(await user.comparePassword(password))) throw AppError.unauthorized("Invalid credentials");
+
+    const tokens = await tokenService.issue(tokenService.buildPayload(user));
+    return { user, ...tokens };
+  },
+
+  async refresh(refreshToken: string): Promise<TokenPair> {
+    return tokenService.rotate(refreshToken, async (userId) => {
+      const user = await User.findOne({ _id: userId, isActive: true }).select("email role").lean();
+      if (!user) throw AppError.unauthorized("Account is no longer active");
+      return { id: userId, email: user.email, role: user.role };
     });
+  },
 
-    return { user, token };
-  }
+  async logout(refreshToken?: string): Promise<void> {
+    if (refreshToken) await tokenService.revoke(refreshToken);
+  },
 
-  async changePassword(
-    userId: string,
-    currentPassword: string,
-    newPassword: string
-  ): Promise<void> {
+  async changePassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
     const user = await User.findById(userId).select("+password");
-    if (!user) throw new AppError("User not found", 404);
-
-    const valid = await user.comparePassword(currentPassword);
-    if (!valid) throw new AppError("Current password is incorrect", 401);
+    if (!user) throw AppError.notFound("User");
+    if (!(await user.comparePassword(currentPassword))) {
+      throw AppError.unauthorized("Current password is incorrect");
+    }
 
     user.password = newPassword;
     await user.save();
-  }
+
+    // Every existing session is now suspect.
+    await tokenService.revokeAll(userId);
+    await cache.invalidate(CacheNamespace.USER);
+  },
 
   async getMe(userId: string): Promise<IUser> {
-    const user = await User.findById(userId);
-    if (!user) throw new AppError("User not found", 404);
-    return user;
-  }
-}
+    const user = await cache.getOrSet(
+      CacheNamespace.USER,
+      userId,
+      async () => User.findById(userId).lean<IUser | null>(),
+      { ttl: env.cacheTtl.entity }
+    );
 
-export const authService = new AuthService();
+    if (!user) throw AppError.notFound("User");
+    return user;
+  },
+};
