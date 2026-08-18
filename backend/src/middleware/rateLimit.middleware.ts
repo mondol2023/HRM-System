@@ -1,81 +1,112 @@
 // src/middleware/rateLimit.middleware.ts
-import { Request, Response } from "express";
+//
+// Sliding-window counter (Cloudflare style): the previous window's count is
+// weighted by how far into the current window we are. Smooth like a true
+// sliding log, but O(1) memory and one round trip — the old INCR+EXPIRE version
+// cost 2-3 round trips per request and let a burst through at window edges.
+import type { NextFunction, Request, RequestHandler, Response } from "express";
+import type { Redis } from "ioredis";
 import { getRedis } from "../config/redis";
-import { AppError } from "../types";
+import { logger } from "../config/logger";
+import { env } from "../config/env";
+import { AppError } from "../core/errors/AppError";
+import type { AuthRequest } from "../types";
 
-/**
- * Simple Redis-backed sliding window rate limiter.
- * Uses Redis INCR + EXPIRE for atomic per-IP counting.
- * No external rate-limit library needed.
- */
-export const rateLimit = (options: {
-  windowMs: number;  // milliseconds
-  max: number;       // max requests per window
-  message?: string;
-  keyPrefix?: string;
-}) => {
-  const {
-    windowMs,
-    max,
-    message = "Too many requests. Please try again later.",
-    keyPrefix = "rl",
-  } = options;
+// KEYS[1]=current bucket, KEYS[2]=previous bucket
+// ARGV: limit, windowSeconds, elapsedRatio
+// Returns { allowed, remaining, retryAfterSeconds }
+const SLIDING_WINDOW = `
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local ratio = tonumber(ARGV[3])
 
-  const windowSeconds = Math.ceil(windowMs / 1000);
+local current = tonumber(redis.call('GET', KEYS[1])) or 0
+local previous = tonumber(redis.call('GET', KEYS[2])) or 0
+local estimate = previous * (1 - ratio) + current
 
-  return async (req: Request, res: Response, next: Parameters<typeof res.json>[0] extends never ? never : (err?: unknown) => void): Promise<void> => {
-    const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
-    const key = `${keyPrefix}:${ip}`;
+if estimate >= limit then
+  return { 0, 0, math.ceil(window * (1 - ratio)) }
+end
 
-    try {
-      const redis = getRedis();
-      const current = await redis.incr(key);
+current = redis.call('INCR', KEYS[1])
+if current == 1 then redis.call('EXPIRE', KEYS[1], window * 2) end
 
-      if (current === 1) {
-        // First request in window — set expiry
-        await redis.expire(key, windowSeconds);
-      }
+return { 1, math.max(0, limit - math.floor(estimate) - 1), 0 }
+`;
 
-      // Set headers for clients
-      res.setHeader("X-RateLimit-Limit", max);
-      res.setHeader("X-RateLimit-Remaining", Math.max(0, max - current));
+interface LimiterRedis extends Redis {
+  slidingWindow(
+    currentKey: string,
+    previousKey: string,
+    limit: number,
+    windowSeconds: number,
+    ratio: number
+  ): Promise<[number, number, number]>;
+}
 
-      if (current > max) {
-        const ttl = await redis.ttl(key);
-        res.setHeader("Retry-After", ttl);
-        next(new AppError(message, 429));
-        return;
-      }
+let limiter: LimiterRedis | null = null;
 
-      next();
-    } catch {
-      // If Redis is down, fail open (don't block requests)
-      next();
-    }
+const client = (): LimiterRedis => {
+  if (limiter) return limiter;
+  const redis = getRedis("limiter") as LimiterRedis;
+  redis.defineCommand("slidingWindow", { numberOfKeys: 2, lua: SLIDING_WINDOW });
+  limiter = redis;
+  return limiter;
+};
+
+export interface RateLimitOptions {
+  max: number;
+  windowSeconds: number;
+  /** Namespace, so the auth and api limiters never share a counter. */
+  scope: string;
+  /** Defaults to user id when authenticated, else IP. */
+  keyGenerator?: (req: Request) => string;
+}
+
+const defaultKey = (req: Request): string => {
+  const user = (req as AuthRequest).user;
+  // Per-user beats per-IP: a whole office behind one NAT must not share a quota.
+  return user ? `u:${user.id}` : `ip:${req.ip ?? "unknown"}`;
+};
+
+export const rateLimit = (options: RateLimitOptions): RequestHandler => {
+  const { max, windowSeconds, scope, keyGenerator = defaultKey } = options;
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const now = Date.now();
+    const windowMs = windowSeconds * 1000;
+    const bucket = Math.floor(now / windowMs);
+    const ratio = (now % windowMs) / windowMs;
+    const identity = keyGenerator(req);
+
+    client()
+      .slidingWindow(
+        `rl:${scope}:${identity}:${bucket}`,
+        `rl:${scope}:${identity}:${bucket - 1}`,
+        max,
+        windowSeconds,
+        ratio
+      )
+      .then(([allowed, remaining, retryAfter]) => {
+        res.setHeader("RateLimit-Limit", max);
+        res.setHeader("RateLimit-Remaining", remaining);
+
+        if (allowed === 1) return next();
+
+        res.setHeader("Retry-After", retryAfter);
+        logger.warn("Rate limit exceeded", { scope, identity, path: req.path });
+        next(AppError.tooManyRequests("Too many requests, please try again later"));
+      })
+      .catch((error: unknown) => {
+        // Fail open: Redis being down must not lock every user out.
+        logger.error("Rate limiter unavailable — allowing request", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        next();
+      });
   };
 };
 
-// ─── Preset limiters ──────────────────────────────────────────────────────────
-
-/** Strict limiter for auth endpoints: 10 req / 15 min */
-export const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: "Too many auth attempts. Please try again in 15 minutes.",
-  keyPrefix: "rl:auth",
-});
-
-/** Standard API limiter: 100 req / min */
-export const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 100,
-  keyPrefix: "rl:api",
-});
-
-/** AI endpoint limiter: 20 req / min (expensive OpenAI calls) */
-export const aiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  message: "Too many AI requests. Please slow down.",
-  keyPrefix: "rl:ai",
-});
+export const authLimiter = rateLimit({ ...env.rateLimit.auth, scope: "auth" });
+export const apiLimiter = rateLimit({ ...env.rateLimit.api, scope: "api" });
+export const aiLimiter = rateLimit({ ...env.rateLimit.ai, scope: "ai" });

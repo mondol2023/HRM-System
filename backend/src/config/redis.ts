@@ -1,46 +1,103 @@
 // src/config/redis.ts
-import Redis from "ioredis";
+import Redis, { type RedisOptions } from "ioredis";
+import { env } from "./env";
 import { logger } from "./logger";
 
-let redisClient: Redis;
+/**
+ * Connections are separated by role rather than shared, because they need
+ * genuinely different failure behaviour:
+ *
+ *  - `cache` / `limiter`: no offline queue. If Redis is down we want the
+ *    command to reject in microseconds so the caller can fail open. Buffering
+ *    commands would turn a Redis blip into an out-of-memory event at load.
+ *  - `queue`: BullMQ requires `maxRetriesPerRequest: null` and uses blocking
+ *    reads, which would stall any client that shared the socket.
+ */
+export type RedisRole = "cache" | "limiter" | "queue";
 
-export const getRedis = (): Redis => {
-  if (!redisClient) {
-    redisClient = new Redis({
-      host: process.env.REDIS_HOST || "localhost",
-      port: parseInt(process.env.REDIS_PORT || "6379"),
-      password: process.env.REDIS_PASSWORD,
-      maxRetriesPerRequest: 3,
-      retryStrategy: (times) => Math.min(times * 50, 2000),
-      lazyConnect: true,
-    });
+const clients = new Map<RedisRole, Redis>();
 
-    redisClient.on("connect", () => logger.info("✅ Redis connected"));
-    redisClient.on("error", (err) => logger.error("Redis error:", err));
-    redisClient.on("reconnecting", () => logger.warn("Redis reconnecting..."));
+const baseOptions = (): RedisOptions => {
+  const options: RedisOptions = {
+    host: env.redis.host,
+    port: env.redis.port,
+    db: env.redis.db,
+    lazyConnect: true,
+    connectTimeout: 5000,
+    keepAlive: 30_000,
+    // Batches commands issued in the same event-loop tick into one round trip.
+    // At a few hundred RPS this is the single biggest Redis latency win.
+    enableAutoPipelining: true,
+    retryStrategy: (times) => Math.min(times * 100, 3000),
+  };
+  if (env.redis.password) options.password = env.redis.password;
+  if (env.redis.tls) options.tls = {};
+  return options;
+};
+
+const roleOptions = (role: RedisRole): RedisOptions => {
+  const options = baseOptions();
+
+  if (role === "queue") {
+    // BullMQ manages its own key namespace and requires unlimited retries.
+    options.maxRetriesPerRequest = null;
+    options.enableReadyCheck = false;
+    return options;
   }
-  return redisClient;
+
+  options.maxRetriesPerRequest = 2;
+  options.enableOfflineQueue = false;
+  options.keyPrefix = `${env.redis.keyPrefix}:`;
+  return options;
 };
 
-// ─── Cache helpers ────────────────────────────────────────────────────────────
-export const cacheGet = async <T>(key: string): Promise<T | null> => {
-  const data = await getRedis().get(key);
-  return data ? (JSON.parse(data) as T) : null;
+const createClient = (role: RedisRole): Redis => {
+  const client = env.redis.url
+    ? new Redis(env.redis.url, roleOptions(role))
+    : new Redis(roleOptions(role));
+
+  client.on("connect", () => logger.info(`Redis[${role}] connected`));
+  client.on("error", (err: Error) => logger.error(`Redis[${role}] error`, { error: err.message }));
+  client.on("reconnecting", () => logger.warn(`Redis[${role}] reconnecting`));
+  client.on("end", () => logger.warn(`Redis[${role}] connection closed`));
+
+  return client;
 };
 
-export const cacheSet = async (
-  key: string,
-  value: unknown,
-  ttlSeconds = 300
-): Promise<void> => {
-  await getRedis().setex(key, ttlSeconds, JSON.stringify(value));
+export const getRedis = (role: RedisRole = "cache"): Redis => {
+  let client = clients.get(role);
+  if (!client) {
+    client = createClient(role);
+    clients.set(role, client);
+  }
+  return client;
 };
 
-export const cacheDel = async (...keys: string[]): Promise<void> => {
-  if (keys.length) await getRedis().del(...keys);
+/** Opens the connections this process actually needs. */
+export const connectRedis = async (roles: RedisRole[] = ["cache", "limiter"]): Promise<void> => {
+  await Promise.all(
+    roles.map(async (role) => {
+      const client = getRedis(role);
+      if (client.status === "end" || client.status === "wait") await client.connect();
+    })
+  );
 };
 
-export const cacheInvalidatePattern = async (pattern: string): Promise<void> => {
-  const keys = await getRedis().keys(pattern);
-  if (keys.length) await getRedis().del(...keys);
+export const pingRedis = async (role: RedisRole = "cache"): Promise<boolean> => {
+  try {
+    return (await getRedis(role).ping()) === "PONG";
+  } catch {
+    return false;
+  }
+};
+
+export const closeRedis = async (): Promise<void> => {
+  await Promise.all(
+    [...clients.values()].map((client) =>
+      client.quit().catch(() => {
+        client.disconnect();
+      })
+    )
+  );
+  clients.clear();
 };

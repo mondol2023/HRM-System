@@ -1,5 +1,9 @@
-import { Request } from "express";
-import { Document, Types } from "mongoose";
+// src/types/index.ts
+import type { Request } from "express";
+import type { Document, Types } from "mongoose";
+import type { Department, EmploymentStatus, Sentiment, UserRole } from "../constants/enums";
+
+export type { Department, EmploymentStatus, Sentiment, UserRole };
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 export interface ITokenPayload {
@@ -11,9 +15,6 @@ export interface ITokenPayload {
 export interface AuthRequest extends Request {
   user?: ITokenPayload;
 }
-
-// ─── User / Auth ─────────────────────────────────────────────────────────────
-export type UserRole = "admin" | "hr" | "manager" | "employee";
 
 export interface IUser extends Document {
   _id: Types.ObjectId;
@@ -27,22 +28,12 @@ export interface IUser extends Document {
   comparePassword(candidate: string): Promise<boolean>;
 }
 
-// ─── Employee ─────────────────────────────────────────────────────────────────
-export type EmploymentStatus = "active" | "on_leave" | "terminated" | "probation";
-export type Department =
-  | "engineering"
-  | "hr"
-  | "finance"
-  | "marketing"
-  | "operations"
-  | "sales"
-  | "legal";
-
+// ─── Employee ────────────────────────────────────────────────────────────────
 export interface IPerformanceNote {
-  _id: Types.ObjectId; // subdocument _id (Mongoose adds by default)
+  _id: Types.ObjectId;
   note: string;
   addedBy: Types.ObjectId;
-  sentiment?: "positive" | "neutral" | "negative";
+  sentiment?: Sentiment;
   sentimentScore?: number;
   addedAt: Date;
 }
@@ -58,14 +49,14 @@ export interface IEmployee extends Document {
   status: EmploymentStatus;
   skills: string[];
   performanceNotes: IPerformanceNote[];
-  attritionRisk?: number; // 0–1 probability
+  attritionRisk?: number;
   attritionRiskUpdatedAt?: Date;
   manager?: Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
 
-// ─── AI ───────────────────────────────────────────────────────────────────────
+// ─── AI ──────────────────────────────────────────────────────────────────────
 export interface IResumeParseResult {
   name: string;
   email: string;
@@ -79,7 +70,7 @@ export interface IResumeParseResult {
 }
 
 export interface ISentimentResult {
-  sentiment: "positive" | "neutral" | "negative";
+  sentiment: Sentiment;
   score: number;
   reasoning: string;
 }
@@ -90,7 +81,7 @@ export interface IAttritionResult {
   recommendation: string;
 }
 
-// ─── Pagination ───────────────────────────────────────────────────────────────
+// ─── Pagination ──────────────────────────────────────────────────────────────
 export interface IPaginationQuery {
   page?: string;
   limit?: string;
@@ -109,23 +100,9 @@ export interface IPaginatedResponse<T> {
   totalPages: number;
 }
 
-// ─── API Response ─────────────────────────────────────────────────────────────
 export interface IApiResponse<T = unknown> {
   success: boolean;
   message: string;
   data?: T;
   errors?: unknown;
-}
-
-// ─── AppError ─────────────────────────────────────────────────────────────────
-export class AppError extends Error {
-  public statusCode: number;
-  public isOperational: boolean;
-
-  constructor(message: string, statusCode: number) {
-    super(message);
-    this.statusCode = statusCode;
-    this.isOperational = true;
-    Error.captureStackTrace(this, this.constructor);
-  }
 }
