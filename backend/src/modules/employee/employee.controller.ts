@@ -6,7 +6,7 @@ import type { AuthRequest, IEmployee } from "../../types";
 
 export const employeeController = {
   async list(req: AuthRequest, res: Response): Promise<void> {
-    const result = await employeeService.list(req.query as unknown as EmployeeListQuery);
+    const result = await employeeService.list(req.query as unknown as EmployeeListQuery, req.user!);
     paginated(res, result, "Employees fetched");
   },
 
@@ -16,23 +16,23 @@ export const employeeController = {
   },
 
   async create(req: AuthRequest, res: Response): Promise<void> {
-    const employee = await employeeService.create(req.body as Partial<IEmployee>);
+    const employee = await employeeService.create(req.body as Partial<IEmployee>, req.user!, req.ip);
     created(res, employee, "Employee created");
   },
 
   async update(req: AuthRequest, res: Response): Promise<void> {
-    const employee = await employeeService.update(req.params["id"]!, req.body as Partial<IEmployee>);
+    const employee = await employeeService.update(req.params["id"]!, req.body as Partial<IEmployee>, req.user!, req.ip);
     ok(res, employee, "Employee updated");
   },
 
   async terminate(req: AuthRequest, res: Response): Promise<void> {
-    await employeeService.terminate(req.params["id"]!);
+    await employeeService.terminate(req.params["id"]!, req.user!, req.ip);
     ok(res, null, "Employee terminated");
   },
 
   async addNote(req: AuthRequest, res: Response): Promise<void> {
     const { note } = req.body as { note: string };
-    const employee = await employeeService.addPerformanceNote(req.params["id"]!, note, req.user!.id);
+    const employee = await employeeService.addPerformanceNote(req.params["id"]!, note, req.user!, req.ip);
     created(res, employee, "Note added. AI analysis queued.");
   },
 

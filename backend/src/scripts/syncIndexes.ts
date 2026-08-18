@@ -4,12 +4,16 @@
 import { connectDB, closeDB } from "../config/db";
 import { User } from "../modules/auth/user.model";
 import { Employee } from "../modules/employee/employee.model";
+import { AuditLog } from "../modules/audit/audit.model";
+import { LeaveType } from "../modules/leave/leaveType.model";
+import { LeaveBalance } from "../modules/leave/leaveBalance.model";
+import { LeaveRequest } from "../modules/leave/leaveRequest.model";
 import { logger } from "../config/logger";
 
 const run = async (): Promise<void> => {
   await connectDB();
 
-  for (const model of [User, Employee]) {
+  for (const model of [User, Employee, AuditLog, LeaveType, LeaveBalance, LeaveRequest]) {
     await model.syncIndexes();
     logger.info(`Indexes synced: ${model.modelName}`);
   }

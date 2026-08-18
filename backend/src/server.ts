@@ -76,7 +76,6 @@ const bootstrap = async (): Promise<void> => {
 };
 
 bootstrap().catch((error: unknown) => {
-  // eslint-disable-next-line no-console
   console.error("Bootstrap failed:", error);
   process.exit(1);
 });

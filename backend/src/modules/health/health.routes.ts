@@ -6,6 +6,7 @@ import { Router } from "express";
 import { isDbHealthy, pingDb } from "../../config/db";
 import { pingRedis } from "../../config/redis";
 import { isShuttingDown } from "../../core/shutdownState";
+import { asyncHandler } from "../../core/http/asyncHandler";
 
 const router = Router();
 
@@ -13,7 +14,7 @@ router.get("/live", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-router.get("/ready", async (_req, res) => {
+router.get("/ready", asyncHandler(async (_req, res) => {
   if (isShuttingDown()) {
     res.status(503).json({ status: "shutting_down" });
     return;
@@ -27,6 +28,6 @@ router.get("/ready", async (_req, res) => {
     cache: cache ? "up" : "down",
     mongoState: isDbHealthy() ? "connected" : "disconnected",
   });
-});
+}));
 
 export default router;

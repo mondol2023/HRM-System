@@ -1,7 +1,9 @@
 // src/modules/employee/employee.service.ts
 import mongoose from "mongoose";
 import { Employee } from "./employee.model";
+import { User } from "../auth/user.model";
 import { aiQueue } from "../ai/ai.queue";
+import { auditService } from "../audit/audit.service";
 import { cache, queryFingerprint } from "../../core/cache/cacheService";
 import { CacheNamespace } from "../../constants/cacheKeys";
 import { AppError } from "../../core/errors/AppError";
@@ -11,6 +13,7 @@ import type {
   Department,
   EmployeeSortField,
   EmploymentStatus,
+  IAuditChange,
   IEmployee,
   IPaginatedResponse,
   ITokenPayload,
@@ -50,14 +53,54 @@ const buildFilter = (query: EmployeeListQuery): mongoose.FilterQuery<IEmployee> 
   return filter;
 };
 
+const EMPTY_PAGE = (query: EmployeeListQuery): IPaginatedResponse<IEmployee> => ({
+  data: [],
+  total: 0,
+  page: query.page,
+  limit: query.limit,
+  totalPages: 0,
+});
+
+/** Field-level diff for the audit trail — only the keys the caller actually sent. */
+const diffChanges = (
+  before: Record<string, unknown>,
+  after: Partial<IEmployee>
+): Record<string, IAuditChange> => {
+  const changes: Record<string, IAuditChange> = {};
+  for (const key of Object.keys(after)) {
+    const from = before[key];
+    const to = (after as Record<string, unknown>)[key];
+    if (JSON.stringify(from) !== JSON.stringify(to)) changes[key] = { from, to };
+  }
+  return changes;
+};
+
 export const employeeService = {
-  async list(query: EmployeeListQuery): Promise<IPaginatedResponse<IEmployee>> {
+  /**
+   * A manager only sees their own record + direct reports here — the same
+   * scope `getById` enforces. Without this a manager role (allowed to hit
+   * this endpoint) could list, filter and sort every employee company-wide,
+   * salary included.
+   */
+  async list(query: EmployeeListQuery, requester: ITokenPayload): Promise<IPaginatedResponse<IEmployee>> {
+    let managerRecordId: string | null | undefined;
+    let cacheSuffix = `list:${queryFingerprint(query as unknown as Record<string, unknown>)}`;
+
+    if (requester.role === "manager") {
+      managerRecordId = await getManagerRecordId(requester.id);
+      if (!managerRecordId) return EMPTY_PAGE(query);
+      cacheSuffix = `list:mgr:${managerRecordId}:${queryFingerprint(query as unknown as Record<string, unknown>)}`;
+    }
+
     return cache.getOrSet(
       CacheNamespace.EMPLOYEE,
-      `list:${queryFingerprint(query as unknown as Record<string, unknown>)}`,
+      cacheSuffix,
       async () => {
         const skip = (query.page - 1) * query.limit;
         const filter = buildFilter(query);
+        if (managerRecordId) {
+          filter.$or = [{ manager: managerRecordId }, { _id: managerRecordId }];
+        }
         const sort: Record<string, 1 | -1> = { [query.sortBy]: query.sortOrder === "asc" ? 1 : -1 };
 
         const [data, total] = await Promise.all([
@@ -101,42 +144,85 @@ export const employeeService = {
     return employee;
   },
 
-  async create(data: Partial<IEmployee>): Promise<IEmployee> {
+  async create(data: Partial<IEmployee>, actor: ITokenPayload, ip?: string): Promise<IEmployee> {
+    if (!(await User.exists({ _id: data.userId }))) {
+      throw AppError.badRequest("userId does not reference an existing user");
+    }
+    if (data.manager && !(await Employee.exists({ _id: data.manager }))) {
+      throw AppError.badRequest("manager does not reference an existing employee");
+    }
+
     const employee = await Employee.create(data);
     await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+
+    await auditService.record({
+      actor,
+      action: "employee.create",
+      targetType: "Employee",
+      targetId: String(employee._id),
+      changes: diffChanges({}, data),
+      ip,
+    });
+
     return employee;
   },
 
-  async update(id: string, data: Partial<IEmployee>): Promise<IEmployee> {
-    const employee = await Employee.findByIdAndUpdate(
-      id,
-      { $set: data },
-      { new: true, runValidators: true }
-    ).lean<IEmployee | null>();
+  async update(id: string, data: Partial<IEmployee>, actor: ITokenPayload, ip?: string): Promise<IEmployee> {
+    if (data.manager) {
+      // A self-referential manager would make an employee their own report.
+      if (String(data.manager) === id) throw AppError.badRequest("An employee cannot be their own manager");
+      if (!(await Employee.exists({ _id: data.manager }))) {
+        throw AppError.badRequest("manager does not reference an existing employee");
+      }
+    }
 
+    // new:false (default) returns the pre-update doc atomically, so the audit
+    // diff can't race a concurrent write the way a separate read-then-update would.
+    const before = await Employee.findByIdAndUpdate(id, { $set: data }, { runValidators: true })
+      .select(Object.keys(data).join(" "))
+      .lean<Record<string, unknown> | null>();
+    if (!before) throw AppError.notFound("Employee");
+
+    const employee = await Employee.findById(id).lean<IEmployee | null>();
     if (!employee) throw AppError.notFound("Employee");
+
     await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+
+    const changes = diffChanges(before, data);
+    if (Object.keys(changes).length > 0) {
+      await auditService.record({ actor, action: "employee.update", targetType: "Employee", targetId: id, changes, ip });
+    }
+
     return employee;
   },
 
   /** Soft delete: the record stays, the status changes. */
-  async terminate(id: string): Promise<void> {
-    const employee = await Employee.findByIdAndUpdate(id, { $set: { status: "terminated" } })
-      .select("_id")
-      .lean();
+  async terminate(id: string, actor: ITokenPayload, ip?: string): Promise<void> {
+    const before = await Employee.findByIdAndUpdate(id, { $set: { status: "terminated" } })
+      .select("status")
+      .lean<{ status: EmploymentStatus } | null>();
 
-    if (!employee) throw AppError.notFound("Employee");
+    if (!before) throw AppError.notFound("Employee");
     await cache.invalidateMany([CacheNamespace.EMPLOYEE, CacheNamespace.EMPLOYEE_STATS]);
+
+    await auditService.record({
+      actor,
+      action: "employee.terminate",
+      targetType: "Employee",
+      targetId: id,
+      changes: { status: { from: before.status, to: "terminated" } },
+      ip,
+    });
   },
 
-  async addPerformanceNote(id: string, note: string, addedBy: string): Promise<IEmployee> {
+  async addPerformanceNote(id: string, note: string, actor: ITokenPayload, ip?: string): Promise<IEmployee> {
     const employee = await Employee.findByIdAndUpdate(
       id,
       {
         $push: {
           performanceNotes: {
             note,
-            addedBy: new mongoose.Types.ObjectId(addedBy),
+            addedBy: new mongoose.Types.ObjectId(actor.id),
             addedAt: new Date(),
           },
         },
@@ -148,11 +234,20 @@ export const employeeService = {
 
     const lastNote = employee.performanceNotes[employee.performanceNotes.length - 1];
 
-    // AI runs off-request: the caller never waits on OpenAI.
+    // AI runs off-request: the caller never waits on OpenAI. Note content itself
+    // isn't duplicated into the audit entry — it already lives on the employee record.
     await Promise.all([
       aiQueue.sentiment({ employeeId: id, noteId: String(lastNote?._id), note }),
       aiQueue.attrition(id),
       cache.invalidate(CacheNamespace.EMPLOYEE),
+      auditService.record({
+        actor,
+        action: "employee.note.add",
+        targetType: "Employee",
+        targetId: id,
+        changes: { noteId: { from: undefined, to: String(lastNote?._id) } },
+        ip,
+      }),
     ]);
 
     return employee;
@@ -192,6 +287,19 @@ export const employeeService = {
   },
 };
 
+/** The requesting manager's own Employee _id, or null if they have no profile. */
+async function getManagerRecordId(requesterId: string): Promise<string | null> {
+  return cache.getOrSet(
+    CacheNamespace.EMPLOYEE,
+    `by-user:${requesterId}`,
+    async () => {
+      const record = await Employee.findOne({ userId: requesterId }).select("_id").lean();
+      return record ? String(record._id) : null;
+    },
+    { ttl: env.cacheTtl.entity, negativeTtl: 30 }
+  );
+}
+
 /**
  * Per-record access control. admin/hr see everyone, a manager sees themselves and
  * their direct reports, everyone else sees only their own record. Without this
@@ -202,16 +310,7 @@ async function assertCanView(employee: IEmployee, requester: ITokenPayload): Pro
   if (toId(employee.userId) === requester.id) return;
 
   if (requester.role === "manager") {
-    const managerRecordId = await cache.getOrSet(
-      CacheNamespace.EMPLOYEE,
-      `by-user:${requester.id}`,
-      async () => {
-        const record = await Employee.findOne({ userId: requester.id }).select("_id").lean();
-        return record ? String(record._id) : null;
-      },
-      { ttl: env.cacheTtl.entity, negativeTtl: 30 }
-    );
-
+    const managerRecordId = await getManagerRecordId(requester.id);
     if (managerRecordId && toId(employee.manager) === managerRecordId) return;
   }
 

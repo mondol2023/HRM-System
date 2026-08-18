@@ -1,0 +1,58 @@
+# Local dev / integration-test stack. Reads ./.env for secrets (docker compose
+# auto-loads a .env next to this file); Mongo/Redis hostnames below override
+# the localhost defaults meant for running the app directly on the host.
+# Mongo + Redis ports are published so `npm test`/`npm run dev` on the host
+# can also point at this stack instead of running Mongo/Redis natively.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports: ["27017:27017"]
+    volumes: ["mongo-data:/data/db"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports: ["5000:5000"]
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/hrm-system
+      REDIS_HOST: redis
+      RUN_WORKER_IN_API: "false" # worker runs as its own service below
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: .
+    command: ["node", "dist/workers/ai.worker.js"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/hrm-system
+      REDIS_HOST: redis
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  mongo-data:
+  redis-data:

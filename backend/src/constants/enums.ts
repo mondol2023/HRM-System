@@ -35,5 +35,31 @@ export type EmployeeSortField = (typeof EMPLOYEE_SORT_FIELDS)[number];
 /** Roles that can see any employee record without an ownership check. */
 export const PRIVILEGED_ROLES: readonly UserRole[] = ["admin", "hr"];
 
+/** Every action the audit trail knows how to record — add here, not ad-hoc strings. */
+export const AUDIT_ACTIONS = [
+  "employee.create",
+  "employee.update",
+  "employee.terminate",
+  "employee.note.add",
+  "leave.request.create",
+  "leave.request.approve",
+  "leave.request.reject",
+  "leave.request.cancel",
+] as const;
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
+/** "monthly" prorates 1/12th of the annual entitlement per month; "fixed" credits the full amount at once (e.g. maternity/paternity). */
+export const LEAVE_ACCRUAL_METHODS = ["monthly", "fixed"] as const;
+export type LeaveAccrualMethod = (typeof LEAVE_ACCRUAL_METHODS)[number];
+
+export const LEAVE_REQUEST_STATUSES = [
+  "pending",
+  "manager_approved",
+  "approved",
+  "rejected",
+  "cancelled",
+] as const;
+export type LeaveRequestStatus = (typeof LEAVE_REQUEST_STATUSES)[number];
+
 /** Mongoose `enum` option wants a mutable array. */
 export const asMutable = <T extends readonly string[]>(values: T): string[] => [...values];
